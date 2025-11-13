@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import datetime as dt
 from typing import List, Dict, Tuple
 
@@ -26,7 +27,7 @@ app = Flask(__name__)
 
 
 # =========================
-# Palīgfunkcijas – laiks
+# Laika palīgfunkcijas
 # =========================
 
 def riga_today_start_end_utc() -> Tuple[str, str]:
@@ -46,7 +47,7 @@ def riga_today_start_end_utc() -> Tuple[str, str]:
 
 
 # =========================
-# Palīgfunkcijas – PayTraq
+# PayTraq palīgfunkcijas
 # =========================
 
 def paytraq_get(path: str, params: Dict = None, timeout: int = 30) -> Tuple[int, str]:
@@ -88,18 +89,48 @@ def parse_products_xml(xml_text: str) -> List[Dict]:
     return items
 
 
-def normalize_product_simple(p: Dict) -> Dict:
+def normalize_product(p: Dict, want_suppliers: bool) -> Dict:
     """
-    Vienkāršoti lauki, lai Chrome var normāli nolasīt.
+    Pilns produkta dict, līdzīgs tam, ko izmanto tavs Products_FULL sync skripts.
     """
     stamps = (p.get("TimeStamps") or {})
-    group = (p.get("Group") or {})
+    inv = (p.get("Inventory") or {})
+    price = (p.get("Price") or {})
+
+    # Suppliers
+    sup_list = None
+    if want_suppliers:
+        sup_list = ((p.get("Suppliers") or {}).get("Supplier"))
+        if isinstance(sup_list, dict):
+            sup_list = [sup_list]
+    sup = None
+    if sup_list:
+        sup = next((s for s in sup_list if (s.get("IsDefault") or "").strip().lower() == "true"), sup_list[0])
+
     return {
         "ItemID": (p.get("ItemID") or "").strip(),
         "Code": (p.get("Code") or "").strip(),
         "Name": (p.get("Name") or "").strip(),
         "Status": (p.get("Status") or "").strip(),
-        "GroupName": (group.get("GroupName") or "").strip(),
+        "Type": (p.get("Type") or "").strip(),
+        "BarCode": (p.get("BarCode") or "").strip(),
+        "GroupName": ((p.get("Group") or {}).get("GroupName") or "").strip(),
+        "CountryOrigin": (p.get("CountryOrigin") or "").strip(),
+        "CommodityCode": (p.get("CommodityCode") or "").strip(),
+        "HasLots": (p.get("HasLots") or "").strip(),
+        "Qty": (inv.get("Qty") or "").strip(),
+        "InterimAvailable": (inv.get("InterimAvailable") or "").strip(),
+        "GrossAmount": (price.get("GrossAmount") or "").strip(),
+        "TaxRate": (price.get("TaxRate") or "").strip(),
+        "Currency": (price.get("Currency") or "").strip(),
+        "Discount": (price.get("Discount") or "").strip(),
+        "SupplierName": (sup.get("SupplierName") if sup else "") or "",
+        "SupplierProductCode": (sup.get("SupplierProductCode") if sup else "") or "",
+        "SupplierProductName": (sup.get("SupplierProductName") if sup else "") or "",
+        "PurchasePrice": (sup.get("PurchasePrice") if sup else "") or "",
+        "PurchasePriceCurrency": (sup.get("PurchasePriceCurrency") if sup else "") or "",
+        "PurchasePriceIncludeTax": (sup.get("PurchasePriceIncludeTax") if sup else "") or "",
+        "SupplierIsDefault": (sup.get("IsDefault") if sup else "") or "",
         "CreatedUTC": (stamps.get("Created") or "").strip(),
         "UpdatedUTC": (stamps.get("Updated") or "").strip(),
     }
@@ -147,7 +178,7 @@ def fetch_all_products(want_suppliers: bool = False,
 
 
 # =========================
-# Palīgfunkcijas – Google Sheets
+# Google Sheets palīgfunkcijas
 # =========================
 
 def get_gspread_client():
@@ -164,14 +195,19 @@ def get_gspread_client():
 
 def ensure_headers(ws) -> List[str]:
     """
-    Paņem 1. rindas galvenes. Ja tukšas – izveido ar default sarakstu.
+    Paņem 1. rindas galvenes. Ja tukšas – izveido ar default (Products_FULL) sarakstu.
     """
     headers = ws.row_values(1)
     if headers:
         return headers
 
     headers = [
-        "ItemID", "Code", "Name", "Status", "GroupName",
+        "ItemID", "Code", "Name", "Status", "Type", "BarCode",
+        "GroupName", "CountryOrigin", "CommodityCode", "HasLots",
+        "Qty", "InterimAvailable",
+        "GrossAmount", "TaxRate", "Currency", "Discount",
+        "SupplierName", "SupplierProductCode", "SupplierProductName",
+        "PurchasePrice", "PurchasePriceCurrency", "PurchasePriceIncludeTax", "SupplierIsDefault",
         "CreatedUTC", "UpdatedUTC",
     ]
     ws.update("A1:" + rowcol_to_a1(1, len(headers)), [headers])
@@ -185,13 +221,12 @@ def build_itemid_map(ws, headers: List[str]) -> Tuple[Dict[str, Tuple[int, List[
     if "ItemID" not in headers:
         raise RuntimeError("Sheetā nav 'ItemID' kolonnas")
 
-    item_idx = headers.index("ItemID")  # 0-based index
-    all_rows = ws.get_all_values()  # 2D list
+    item_idx = headers.index("ItemID")  # 0-based
+    all_rows = ws.get_all_values()
 
     mapping: Dict[str, Tuple[int, List[str]]] = {}
-
-    for i in range(1, len(all_rows)):  # sākot ar 2. rindu (i=1)
-        row_index = i + 1  # 1-based rindas numurs sheets
+    for i in range(1, len(all_rows)):  # sākot ar 2. rindu
+        row_index = i + 1  # 1-based
         row = all_rows[i]
         if len(row) <= item_idx:
             continue
@@ -206,12 +241,23 @@ def build_itemid_map(ws, headers: List[str]) -> Tuple[Dict[str, Tuple[int, List[
 def make_row_from_headers(item: Dict, headers: List[str]) -> List[str]:
     """
     Pārvērš produkta dict -> rindu pēc headers secības.
-    Ja lauks nav item’ā, liek ''.
     """
     row = []
     for h in headers:
         row.append(item.get(h, "") or "")
     return row
+
+
+def ensure_log_headers(ws) -> List[str]:
+    """
+    Atskaites sheet galvenes: TimestampRiga, ItemID, Code, Name, ChangedFieldsJSON
+    """
+    headers = ws.row_values(1)
+    if headers:
+        return headers
+    headers = ["TimestampRiga", "ItemID", "Code", "Name", "ChangedFieldsJSON"]
+    ws.update("A1:" + rowcol_to_a1(1, len(headers)), [headers])
+    return headers
 
 
 # =========================
@@ -233,14 +279,12 @@ def health():
 @app.get("/products-updated-today")
 def products_updated_today():
     """
-    Chrome atvērams endpoints:
     Parāda visus produktus, kuriem UpdatedUTC ir šodien (pēc Europe/Riga).
     """
     if not PAYTRAQ_KEY or not PAYTRAQ_TOKEN:
         return jsonify({"ok": False, "error": "Missing PAYTRAQ_API_KEY or PAYTRAQ_API_TOKEN"}), 400
 
     want_suppliers = request.args.get("suppliers", "0").lower() in ("1", "true", "yes")
-
     start_iso, end_iso = riga_today_start_end_utc()
 
     items_all, debug = fetch_all_products(want_suppliers=want_suppliers)
@@ -253,7 +297,7 @@ def products_updated_today():
 
     today_updated = []
     for p in items_all:
-        norm = normalize_product_simple(p)
+        norm = normalize_product(p, want_suppliers)
         ts = norm["UpdatedUTC"]
         if ts and (start_iso <= ts <= end_iso):
             today_updated.append(norm)
@@ -272,10 +316,8 @@ def sync_updated_products_to_sheet():
     """
     1) Atrod visus šodien UPDATED produktus PayTraq
     2) Google Sheetā (pēc ItemID) pārraksta rindas
-    3) Atgriež atskaiti, kuri produkti tika atjaunināti un kādi lauki mainījās
+    3) Log-sheetā pieraksta atskaiti par izmaiņām (lai var izmantot citos servisos)
     """
-    import json  # vietējais imports, lai nebūtu konfuzs augšā
-
     if not PAYTRAQ_KEY or not PAYTRAQ_TOKEN:
         return jsonify({"ok": False, "error": "Missing PAYTRAQ_API_KEY or PAYTRAQ_API_TOKEN"}), 400
     if not GOOGLE_SA_JSON:
@@ -283,6 +325,7 @@ def sync_updated_products_to_sheet():
 
     spreadsheet_id = request.args.get("spreadsheet_id", "").strip()
     worksheet_name = request.args.get("worksheet", "Products_FULL").strip()
+    log_worksheet_name = request.args.get("log_worksheet", "Products_Updated_Log").strip()
     want_suppliers = request.args.get("suppliers", "0").lower() in ("1", "true", "yes")
 
     if not spreadsheet_id:
@@ -301,25 +344,25 @@ def sync_updated_products_to_sheet():
 
     updated_today = []
     for p in items_all:
-        norm = normalize_product_simple(p)
+        norm = normalize_product(p, want_suppliers)
         ts = norm["UpdatedUTC"]
         if ts and (start_iso <= ts <= end_iso):
             updated_today.append(norm)
 
-    # 2) Google Sheets sagatavošana
+    # 2) Google Sheets sagatavošana (galvenais sheet + log-sheet)
     try:
-        info = json.loads(GOOGLE_SA_JSON)
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ]
-        creds = Credentials.from_service_account_info(info, scopes=scopes)
-        gc = gspread.authorize(creds)
-
+        gc = get_gspread_client()
         sh = gc.open_by_key(spreadsheet_id)
+
         ws = sh.worksheet(worksheet_name)
         headers = ensure_headers(ws)
         item_map, item_idx = build_itemid_map(ws, headers)
+
+        try:
+            log_ws = sh.worksheet(log_worksheet_name)
+        except gspread.WorksheetNotFound:
+            log_ws = sh.add_worksheet(title=log_worksheet_name, rows=1000, cols=10)
+        log_headers = ensure_log_headers(log_ws)
     except Exception as e:
         return jsonify({
             "ok": False,
@@ -338,6 +381,12 @@ def sync_updated_products_to_sheet():
     updates_info = []
     not_found = []
     update_requests = []
+    log_rows = []
+
+    # Rīgas timestamp logam
+    riga = tz.gettz("Europe/Riga")
+    now_riga = dt.datetime.now(riga)
+    ts_riga_str = now_riga.strftime("%Y-%m-%d %H:%M:%S")
 
     for it in updated_today:
         item_id = (it.get("ItemID") or "").strip()
@@ -367,7 +416,10 @@ def sync_updated_products_to_sheet():
                     "new": new_val,
                 }
 
-        # ja reāli nekas nav mainījies, varam izlaist update, bet atskaitē tas tik un tā būs noderīgs
+        if not changed_fields:
+            # Neko faktiski nemainām
+            continue
+
         update_requests.append((row_index, new_row))
         updates_info.append({
             "ItemID": item_id,
@@ -376,17 +428,31 @@ def sync_updated_products_to_sheet():
             "changed_fields": changed_fields
         })
 
-    # 3) Pārrakstām rindas sheetā (pa vienai – vienkāršāk un saprotami)
+        # Log row: TimestampRiga, ItemID, Code, Name, ChangedFieldsJSON
+        changed_json = json.dumps(changed_fields, ensure_ascii=False)
+        log_rows.append([
+            ts_riga_str,
+            item_id,
+            it.get("Code", ""),
+            it.get("Name", ""),
+            changed_json
+        ])
+
+    # 3) Pārrakstām rindas sheetā (galvenajā) un pierakstām log-sheet
     for row_index, new_row in update_requests:
         start_cell = rowcol_to_a1(row_index, 1)
         end_cell = rowcol_to_a1(row_index, len(headers))
         ws.update(f"{start_cell}:{end_cell}", [new_row], value_input_option="USER_ENTERED")
 
+    if log_rows:
+        log_ws.append_rows(log_rows, value_input_option="USER_ENTERED")
+
     return jsonify({
         "ok": True,
         "sheet": {
             "spreadsheet_id": spreadsheet_id,
-            "worksheet": worksheet_name
+            "worksheet": worksheet_name,
+            "log_worksheet": log_worksheet_name,
         },
         "window_utc": {"start": start_iso, "end": end_iso},
         "counts": {
