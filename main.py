@@ -91,7 +91,7 @@ def parse_products_xml(xml_text: str) -> List[Dict]:
 
 def normalize_product(p: Dict, want_suppliers: bool) -> Dict:
     """
-    Pilns produkta dict, līdzīgs tam, ko izmanto Products_FULL sync skripts.
+    Pilns produkta dict (balstīts uz tavu Products_FULL formātu).
     """
     stamps = (p.get("TimeStamps") or {})
     inv = (p.get("Inventory") or {})
@@ -326,7 +326,8 @@ def sync_updated_products_to_sheet():
     """
     1) Atrod visus šodien UPDATED produktus PayTraq
     2) Google Sheetā (pēc ItemID) pārraksta rindas galvenajā lapā (Products_FULL)
-    3) 'Product updates' lapā pieraksta PA VIENAI RINDAI par katru mainīto lauku:
+    3) 'Product updates' lapā pieraksta PA VIENAI RINDAI par katru lauku,
+       kas PATIESSI mainījies (ignorē laukus, kur vecā un jaunā vērtība sakrīt):
        TimestampRiga | ItemID | Code | Name | FieldName | OldValue | NewValue
     """
     if not PAYTRAQ_KEY or not PAYTRAQ_TOKEN:
@@ -401,7 +402,7 @@ def sync_updated_products_to_sheet():
     now_riga = dt.datetime.now(riga)
     ts_riga_str = now_riga.strftime("%Y-%m-%d %H:%M:%S")
 
-    # Product updates – nosakām nākamo brīvo rindu
+    # Product updates – nākamā brīvā rinda
     existing_updates_rows = updates_ws.get_all_values()
     next_updates_row = len(existing_updates_rows) + 1  # 1-based
 
@@ -426,12 +427,20 @@ def sync_updated_products_to_sheet():
         for idx in range(max_len):
             old_val = old_row[idx] if idx < len(old_row) else ""
             new_val = new_row[idx] if idx < len(new_row) else ""
-            if (old_val or "") != (new_val or ""):
-                field_name = headers[idx] if idx < len(headers) else f"COL_{idx+1}"
-                changed_fields[field_name] = {
-                    "old": old_val,
-                    "new": new_val,
-                }
+
+            # Normalizējam, lai ignorētu niecīgas atšķirības (whitespace)
+            old_norm = (old_val or "").strip()
+            new_norm = (new_val or "").strip()
+
+            # Ja identiski → nelogojam
+            if old_norm == new_norm:
+                continue
+
+            field_name = headers[idx] if idx < len(headers) else f"COL_{idx+1}"
+            changed_fields[field_name] = {
+                "old": old_val,
+                "new": new_val,
+            }
 
         if not changed_fields:
             # nekā nav mainīts – neliekam ne galvenajā, ne logā
