@@ -271,6 +271,40 @@ def get_or_create_updates_sheet(sh, title: str = "Product updates"):
 
 
 # =========================
+# Salīdzināšanas normalizācija
+# =========================
+
+def normalize_for_compare(val: str) -> str:
+    """
+    Normalizē vērtību salīdzināšanai.
+    - Apgriež atstarpes
+    - Ja izskatās pēc skaitļa (ar . vai ,), pārveido uz kanonisku formu:
+      * 13,00 -> 13
+      * 0.000 -> 0
+      * 21.5 -> 21.5
+    - Ja nav skaitlis, salīdzina kā plain tekstu (bez ārējām atstarpēm)
+    """
+    if val is None:
+        return ""
+    s = str(val).strip()
+    if s == "":
+        return ""
+
+    # Mēģinām interpretēt kā skaitli
+    # (gan 13.00, gan 13,00 -> 13)
+    candidate = s.replace(" ", "").replace(",", ".")
+    try:
+        num = float(candidate)
+        if num.is_integer():
+            return str(int(num))
+        # līdz 4 zīmēm aiz komata, bez liekiem nullēm
+        return f"{num:.4f}".rstrip("0").rstrip(".")
+    except ValueError:
+        # Nav skaitlis – salīdzinām tekstuāli
+        return s
+
+
+# =========================
 # Flask API
 # =========================
 
@@ -327,7 +361,8 @@ def sync_updated_products_to_sheet():
     1) Atrod visus šodien UPDATED produktus PayTraq
     2) Google Sheetā (pēc ItemID) pārraksta rindas galvenajā lapā (Products_FULL)
     3) 'Product updates' lapā pieraksta PA VIENAI RINDAI par katru lauku,
-       kas PATIESSI mainījies (ignorē laukus, kur vecā un jaunā vērtība sakrīt):
+       kas PATIESSI mainījies (ignorē laukus, kur vecā un jaunā vērtība
+       pēc normalizācijas sakrīt):
        TimestampRiga | ItemID | Code | Name | FieldName | OldValue | NewValue
     """
     if not PAYTRAQ_KEY or not PAYTRAQ_TOKEN:
@@ -422,17 +457,17 @@ def sync_updated_products_to_sheet():
         row_index, old_row = item_map[item_id]
         new_row = make_row_from_headers(it, headers)
 
-        changed_fields = {}
+        changed_fields: Dict[str, Dict[str, str]] = {}
         max_len = max(len(old_row), len(new_row))
+
         for idx in range(max_len):
             old_val = old_row[idx] if idx < len(old_row) else ""
             new_val = new_row[idx] if idx < len(new_row) else ""
 
-            # Normalizējam, lai ignorētu niecīgas atšķirības (whitespace)
-            old_norm = (old_val or "").strip()
-            new_norm = (new_val or "").strip()
+            old_norm = normalize_for_compare(old_val)
+            new_norm = normalize_for_compare(new_val)
 
-            # Ja identiski → nelogojam
+            # Ja pēc normalizācijas vienādi -> IGNORĒJAM
             if old_norm == new_norm:
                 continue
 
@@ -443,7 +478,7 @@ def sync_updated_products_to_sheet():
             }
 
         if not changed_fields:
-            # nekā nav mainīts – neliekam ne galvenajā, ne logā
+            # Reāli nekā nav mainīts – neliekam ne galvenajā, ne atskaitē
             continue
 
         # galvenā lapa: rindu pārrakstīšana
