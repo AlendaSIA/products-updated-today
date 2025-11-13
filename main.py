@@ -91,7 +91,7 @@ def parse_products_xml(xml_text: str) -> List[Dict]:
 
 def normalize_product(p: Dict, want_suppliers: bool) -> Dict:
     """
-    Pilns produkta dict, līdzīgs tam, ko izmanto tavs Products_FULL sync skripts.
+    Pilns produkta dict, līdzīgs tam, ko izmanto Products_FULL sync skripts.
     """
     stamps = (p.get("TimeStamps") or {})
     inv = (p.get("Inventory") or {})
@@ -248,16 +248,27 @@ def make_row_from_headers(item: Dict, headers: List[str]) -> List[str]:
     return row
 
 
-def ensure_log_headers(ws) -> List[str]:
+def get_or_create_updates_sheet(sh, headers: List[str], title: str = "Product updates"):
     """
-    Atskaites sheet galvenes: TimestampRiga, ItemID, Code, Name, ChangedFieldsJSON
+    Atrod vai izveido 'Product updates' sheet.
+    1. kolonna: TimestampRiga
+    2+ kolonnas: tie paši headers kā galvenajā lapā.
     """
-    headers = ws.row_values(1)
-    if headers:
-        return headers
-    headers = ["TimestampRiga", "ItemID", "Code", "Name", "ChangedFieldsJSON"]
-    ws.update("A1:" + rowcol_to_a1(1, len(headers)), [headers])
-    return headers
+    try:
+        ws = sh.worksheet(title)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=title, rows=2000, cols=len(headers) + 1)
+        header_row = ["TimestampRiga"] + headers
+        ws.update("A1:" + rowcol_to_a1(1, len(header_row)), [header_row])
+        return ws
+
+    # ja eksistē, pārbaudām, vai ir galvenes, ja nav – uzliekam
+    existing_headers = ws.row_values(1)
+    if not existing_headers:
+        header_row = ["TimestampRiga"] + headers
+        ws.update("A1:" + rowcol_to_a1(1, len(header_row)), [header_row])
+
+    return ws
 
 
 # =========================
@@ -315,8 +326,9 @@ def products_updated_today():
 def sync_updated_products_to_sheet():
     """
     1) Atrod visus šodien UPDATED produktus PayTraq
-    2) Google Sheetā (pēc ItemID) pārraksta rindas
-    3) Log-sheetā pieraksta atskaiti par izmaiņām (lai var izmantot citos servisos)
+    2) Google Sheetā (pēc ItemID) pārraksta rindas galvenajā lapā (Products_FULL)
+    3) 'Product updates' lapā pieraksta pa rindai visiem atjaunotajiem produktiem,
+       ar TimestampRiga 1. kolonnā un sarkani iezīmētiem mainītajiem laukiem.
     """
     if not PAYTRAQ_KEY or not PAYTRAQ_TOKEN:
         return jsonify({"ok": False, "error": "Missing PAYTRAQ_API_KEY or PAYTRAQ_API_TOKEN"}), 400
@@ -325,7 +337,7 @@ def sync_updated_products_to_sheet():
 
     spreadsheet_id = request.args.get("spreadsheet_id", "").strip()
     worksheet_name = request.args.get("worksheet", "Products_FULL").strip()
-    log_worksheet_name = request.args.get("log_worksheet", "Products_Updated_Log").strip()
+    log_worksheet_name = request.args.get("log_worksheet", "Product updates").strip()
     want_suppliers = request.args.get("suppliers", "0").lower() in ("1", "true", "yes")
 
     if not spreadsheet_id:
@@ -349,7 +361,7 @@ def sync_updated_products_to_sheet():
         if ts and (start_iso <= ts <= end_iso):
             updated_today.append(norm)
 
-    # 2) Google Sheets sagatavošana (galvenais sheet + log-sheet)
+    # 2) Google Sheets sagatavošana (galvenais sheet + Product updates)
     try:
         gc = get_gspread_client()
         sh = gc.open_by_key(spreadsheet_id)
@@ -358,11 +370,7 @@ def sync_updated_products_to_sheet():
         headers = ensure_headers(ws)
         item_map, item_idx = build_itemid_map(ws, headers)
 
-        try:
-            log_ws = sh.worksheet(log_worksheet_name)
-        except gspread.WorksheetNotFound:
-            log_ws = sh.add_worksheet(title=log_worksheet_name, rows=1000, cols=10)
-        log_headers = ensure_log_headers(log_ws)
+        updates_ws = get_or_create_updates_sheet(sh, headers, title=log_worksheet_name)
     except Exception as e:
         return jsonify({
             "ok": False,
@@ -374,6 +382,13 @@ def sync_updated_products_to_sheet():
             "ok": True,
             "message": "Šodien PayTraq nav neviena updated produkta.",
             "counts": {"updated_today": 0, "updated_rows": 0, "not_found": 0},
+            "sheet": {
+                "spreadsheet_id": spreadsheet_id,
+                "worksheet": worksheet_name,
+                "log_worksheet": log_worksheet_name,
+            },
+            "updated_products": [],
+            "not_found": [],
             "window_utc": {"start": start_iso, "end": end_iso},
             "debug": debug[-10:]
         }), 200
@@ -381,12 +396,15 @@ def sync_updated_products_to_sheet():
     updates_info = []
     not_found = []
     update_requests = []
-    log_rows = []
 
     # Rīgas timestamp logam
     riga = tz.gettz("Europe/Riga")
     now_riga = dt.datetime.now(riga)
     ts_riga_str = now_riga.strftime("%Y-%m-%d %H:%M:%S")
+
+    # Nosakām, no kura rindas indeksa sāksies jaunās rindas 'Product updates' lapā
+    existing_updates_rows = updates_ws.get_all_values()
+    next_updates_row = len(existing_updates_rows) + 1  # 1-based
 
     for it in updated_today:
         item_id = (it.get("ItemID") or "").strip()
@@ -417,10 +435,12 @@ def sync_updated_products_to_sheet():
                 }
 
         if not changed_fields:
-            # Neko faktiski nemainām
+            # nekā nav mainīts – neliekam ne galvenajā, ne logā
             continue
 
+        # galvenā lapa: rindu pārrakstīšana
         update_requests.append((row_index, new_row))
+
         updates_info.append({
             "ItemID": item_id,
             "Code": it.get("Code", ""),
@@ -428,24 +448,34 @@ def sync_updated_products_to_sheet():
             "changed_fields": changed_fields
         })
 
-        # Log row: TimestampRiga, ItemID, Code, Name, ChangedFieldsJSON
-        changed_json = json.dumps(changed_fields, ensure_ascii=False)
-        log_rows.append([
-            ts_riga_str,
-            item_id,
-            it.get("Code", ""),
-            it.get("Name", ""),
-            changed_json
-        ])
+        # Product updates sheet: TimestampRiga + visi lauki
+        log_row = [ts_riga_str] + new_row
+        start_cell = rowcol_to_a1(next_updates_row, 1)
+        end_cell = rowcol_to_a1(next_updates_row, len(log_row))
+        updates_ws.update(
+            f"{start_cell}:{end_cell}",
+            [log_row],
+            value_input_option="USER_ENTERED"
+        )
 
-    # 3) Pārrakstām rindas sheetā (galvenajā) un pierakstām log-sheet
+        # Krāsojam mainītos laukus sarkanīgi
+        for field_name in changed_fields.keys():
+            if field_name not in headers:
+                continue
+            col_in_main = headers.index(field_name) + 1  # 1-based main lapā
+            col_in_updates = col_in_main + 1  # +1, jo 1. kolonna ir Timestamp
+            cell_a1 = rowcol_to_a1(next_updates_row, col_in_updates)
+            updates_ws.format(cell_a1, {
+                "backgroundColor": {"red": 1.0, "green": 0.85, "blue": 0.85}
+            })
+
+        next_updates_row += 1
+
+    # 3) Pārrakstām rindas sheetā (galvenajā lapā)
     for row_index, new_row in update_requests:
         start_cell = rowcol_to_a1(row_index, 1)
         end_cell = rowcol_to_a1(row_index, len(headers))
         ws.update(f"{start_cell}:{end_cell}", [new_row], value_input_option="USER_ENTERED")
-
-    if log_rows:
-        log_ws.append_rows(log_rows, value_input_option="USER_ENTERED")
 
     return jsonify({
         "ok": True,
