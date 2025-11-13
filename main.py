@@ -23,18 +23,23 @@ app = Flask(__name__)
 # Palīgfunkcijas
 # =========================
 
-def riga_today_start_utc_iso() -> str:
+def riga_today_start_end_utc() -> Tuple[str, str]:
     """
-    Atgriež šodienas sākumu (00:00:00) Rīgā, pārtaisītu uz UTC ISO formātu.
+    Atgriež (start_utc_iso, end_utc_iso) šodienai Europe/Riga zonā, ISO UTC formātā.
     """
     riga = tz.gettz("Europe/Riga")
     now_riga = dt.datetime.now(riga)
     start_riga = dt.datetime(now_riga.year, now_riga.month, now_riga.day, 0, 0, 0, tzinfo=riga)
+    end_riga = start_riga + dt.timedelta(days=1)
+
     start_utc = start_riga.astimezone(tz.UTC)
-    return start_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_utc = end_riga.astimezone(tz.UTC)
+
+    to_iso = lambda x: x.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return to_iso(start_utc), to_iso(end_utc)
 
 
-def paytraq_get(path: str, params: Dict = None, timeout: int = 30):
+def paytraq_get(path: str, params: Dict = None, timeout: int = 30) -> Tuple[int, str]:
     """
     GET helperis uz PayTraq API.
     """
@@ -57,13 +62,12 @@ def paytraq_get(path: str, params: Dict = None, timeout: int = 30):
         return 599, f"REQUEST_ERROR: {repr(e)}"
 
 
-def parse_products_xml(xml_text: str):
+def parse_products_xml(xml_text: str) -> List[Dict]:
     """
-    Atgriež produktu sarakstu no XML (<Products><Product>..)
+    Atgriež produktu sarakstu no XML (<Products><Product>..).
     Ja atnāk tukša lapa — atgriež [].
     """
     data = xmltodict.parse(xml_text)
-
     products_node = (data or {}).get("Products")
     if products_node in (None, ""):
         return []
@@ -90,18 +94,18 @@ def normalize_product_simple(p: Dict) -> Dict:
     }
 
 
-def fetch_products_updated_after(updated_after_iso: str,
-                                want_suppliers: bool = False,
-                                max_pages: int = 200,
-                                page_sleep: float = 0.3):
+def fetch_all_products(want_suppliers: bool = False,
+                       max_pages: int = 500,
+                       page_sleep: float = 0.4) -> Tuple[List[Dict], List[str]]:
     """
-    Lapo cauri PayTraq /products ar parametru updated_after.
+    Lapo cauri /products un savāc VISUS produktus.
+    (tieši tāda pieeja kā tavā esošajā servisā, tikai vienkāršāka)
     """
-    collected = []
-    debug = []
+    collected: List[Dict] = []
+    debug: List[str] = []
     page = 1
 
-    base_params = {"updated_after": updated_after_iso}
+    base_params: Dict[str, str] = {}
     if want_suppliers:
         base_params["suppliers"] = "true"
 
@@ -112,17 +116,20 @@ def fetch_products_updated_after(updated_after_iso: str,
         status, text = paytraq_get("/products", params=params)
         debug.append(f"page={page} status={status}")
 
+        if status == 401:
+            debug.append("Unauthorized (401) — pārbaudi PAYTRAQ_API_KEY / PAYTRAQ_API_TOKEN")
+            return None, debug
+
         if status >= 400:
-            snippet = (text or "")[:200].replace("\n", " ")
-            debug.append(f"HTTP_ERROR: {snippet}")
-            break
+            snippet = (text or "")[:300].replace("\n", " ")
+            debug.append(f"HTTP {status} body_snippet={snippet}")
+            return None, debug
 
         items = parse_products_xml(text)
         if not items:
             break
 
         collected.extend(items)
-
         page += 1
         time.sleep(page_sleep)
 
@@ -146,24 +153,35 @@ def health():
 def products_updated_today():
     """
     Chrome atvērams endpoints:
-    Parāda visus produktus, kas šodien UPDATED PayTraq.
+    Parāda visus produktus, kuriem UpdatedUTC ir šodien (pēc Europe/Riga).
     """
     if not PAYTRAQ_KEY or not PAYTRAQ_TOKEN:
         return jsonify({"ok": False, "error": "Missing PAYTRAQ_API_KEY or PAYTRAQ_API_TOKEN"}), 400
 
     want_suppliers = request.args.get("suppliers", "0").lower() in ("1", "true", "yes")
 
-    today_start_utc = riga_today_start_utc_iso()
+    start_iso, end_iso = riga_today_start_end_utc()
 
-    items_raw, debug = fetch_products_updated_after(today_start_utc, want_suppliers)
+    items_all, debug = fetch_all_products(want_suppliers=want_suppliers)
+    if items_all is None:
+        return jsonify({
+            "ok": False,
+            "error": "Fetch failed",
+            "debug": debug
+        }), 502
 
-    normalized = [normalize_product_simple(p) for p in items_raw]
+    today_updated = []
+    for p in items_all:
+        norm = normalize_product_simple(p)
+        ts = norm["UpdatedUTC"]
+        if ts and (start_iso <= ts <= end_iso):
+            today_updated.append(norm)
 
     return jsonify({
         "ok": True,
-        "updated_after_utc": today_start_utc,
-        "count": len(normalized),
-        "products": normalized,
+        "window_utc": {"start": start_iso, "end": end_iso},
+        "count": len(today_updated),
+        "products": today_updated,
         "debug": debug[-10:]
     }), 200
 
